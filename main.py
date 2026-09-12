@@ -83,12 +83,14 @@ STATE MACHINE DIAGRAM
 import asyncio
 import enum
 import hashlib
+import io
 import json
 import logging
 import os
 import random
 import re
 import sys
+import tempfile
 from datetime import datetime, timezone
 
 # Load .env before anything else so BOT_TOKEN etc. are available
@@ -906,6 +908,444 @@ async def _handle_teacher_guidance(
 
 
 # ==============================================================================
+# SECTION: VOICE NOTE TRANSCRIPTION (Groq Whisper)
+# ==============================================================================
+# Allows students to send Telegram voice notes instead of typing.
+# Especially important for distressed children who cannot type coherently.
+# Uses Groq's whisper-large-v3-turbo model for fast, accurate transcription.
+
+
+async def _transcribe_voice(file_path: str) -> str:
+    """
+    Transcribe an audio file using Groq's Whisper API.
+
+    Args:
+        file_path: Absolute path to the .ogg voice file on disk.
+
+    Returns:
+        The transcribed text string, or empty string on failure.
+    """
+    if not (GROQ_AVAILABLE and GROQ_API_KEY):
+        logger.warning("Voice transcription unavailable — Groq not configured")
+        return ""
+
+    try:
+        async with httpx.AsyncClient() as http_client:
+            client = AsyncGroq(api_key=GROQ_API_KEY, http_client=http_client)
+            with open(file_path, "rb") as audio_file:
+                transcription = await client.audio.transcriptions.create(
+                    file=("voice.ogg", audio_file),
+                    model="whisper-large-v3-turbo",
+                    language="en",
+                    response_format="text",
+                )
+        # The response is the transcribed text directly
+        result = str(transcription).strip()
+        logger.info(
+            "Voice transcription completed: %d chars", len(result)
+        )
+        return result
+    except Exception as e:
+        logger.error("Voice transcription failed: %s — %s", type(e).__name__, str(e)[:150])
+        return ""
+
+
+async def voice_note_handler(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """
+    Handle voice notes sent by users.
+
+    Downloads the .ogg file from Telegram, transcribes it via Groq Whisper,
+    and then feeds the resulting text into the existing message_handler logic
+    so triage, relay, and all other states work seamlessly with voice input.
+    """
+    # Only handle private chats
+    if update.effective_chat.type != "private":
+        return
+
+    chat_id = update.effective_chat.id
+    _track_msg(chat_id, update.message.message_id)
+
+    session = _get_session(chat_id)
+    state = session["state"]
+
+    # If user is in a state that doesn't accept text input, ignore
+    if state in (State.STATE_WIPED, State.STATE_POCSO_REDIRECT, State.STATE_START):
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="Please use the menu buttons to navigate. Send /start if you don't see a menu.",
+            reply_markup=build_main_menu_keyboard(),
+        )
+        return
+
+    # Show a "transcribing" indicator so the child knows it's working
+    typing_msg = await context.bot.send_message(
+        chat_id=chat_id,
+        text="🎙️ *I hear you — give me just a moment to listen to your voice note…*",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    _track_msg(chat_id, typing_msg.message_id)
+
+    # Download the voice file
+    tmp_path = None
+    try:
+        voice = update.message.voice
+        tg_file = await context.bot.get_file(voice.file_id)
+
+        # Save to a temp file
+        with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
+            tmp_path = tmp.name
+            await tg_file.download_to_drive(tmp_path)
+
+        # Transcribe
+        transcribed_text = await _transcribe_voice(tmp_path)
+
+        if not transcribed_text:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "😕 *I couldn't quite catch what you said.*\n\n"
+                    "Could you try sending a text message instead? "
+                    "Even just a few words is totally okay. 💙"
+                ),
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=build_triage_panic_keyboard(),
+            )
+            return
+
+        # Show the child what we heard (builds trust + lets them correct if needed)
+        confirm_msg = await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"🎙️ *I heard:* _{transcribed_text}_",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        _track_msg(chat_id, confirm_msg.message_id)
+
+        # Now route through the same logic as a text message.
+        # We reuse the existing state-based routing from message_handler.
+        if state == State.STATE_TRIAGE:
+            await _handle_triage_answer(chat_id, transcribed_text, context.bot, session)
+        elif state == State.STATE_TEACHER_GUIDANCE:
+            await _handle_teacher_guidance(chat_id, transcribed_text, context.bot, session)
+        elif state == State.STATE_COUNSELOR_ACTIVE:
+            # Relay transcribed voice to counselor
+            case_id = session.get("case_id") or student_to_case.get(chat_id)
+            if case_id and case_id in cases:
+                case = cases[case_id]
+                counselor_chat_id = case.get("counselor_chat_id")
+                if counselor_chat_id:
+                    try:
+                        await context.bot.send_message(
+                            chat_id=counselor_chat_id,
+                            text=f"🎙️ *[{case_id}] Student (voice):*\n{transcribed_text}",
+                            parse_mode=ParseMode.MARKDOWN,
+                        )
+                    except Exception as e:
+                        logger.error("Relay voice->counselor failed: %s", type(e).__name__)
+                        await context.bot.send_message(
+                            chat_id=chat_id,
+                            text="⚠️ Your message couldn't be delivered. Please try again or send /start.",
+                        )
+        else:
+            # Check if this is a counselor relaying a voice note
+            case_id_c = counselor_to_case.get(chat_id)
+            if case_id_c and case_id_c in cases:
+                case = cases[case_id_c]
+                if case.get("counselor_chat_id") == chat_id and case["status"] == "active":
+                    student_chat_id = case["student_chat_id"]
+                    try:
+                        msg = await context.bot.send_message(
+                            chat_id=student_chat_id,
+                            text=f"🎙️ *Counselor (voice):*\n{transcribed_text}",
+                            parse_mode=ParseMode.MARKDOWN,
+                            reply_markup=build_student_relay_keyboard(),
+                        )
+                        _track_msg(student_chat_id, msg.message_id)
+                    except Exception as e:
+                        logger.error("Relay voice counselor->student failed: %s", type(e).__name__)
+
+    except Exception as e:
+        logger.error("Voice note handling failed: %s — %s", type(e).__name__, str(e)[:150])
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "😕 *Something went wrong with the voice note.*\n\n"
+                "Could you try typing your message instead? 💙"
+            ),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    finally:
+        # Clean up the temp file
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
+# ==============================================================================
+# SECTION: INCIDENT DOSSIER EXPORT (Counselor Feature)
+# ==============================================================================
+# Generates an anonymized, structured incident report for counselors.
+# Useful for school principals, cyber cells, or internal record-keeping.
+
+# Indian legal references by severity/type for the dossier
+_LEGAL_REFERENCES = {
+    "cyberbullying": [
+        "IT Act 2000, Section 66A (struck down but relevant context)",
+        "IT Act 2000, Section 67 — Publishing obscene material",
+        "IPC Section 507 — Criminal intimidation by anonymous communication",
+    ],
+    "impersonation": [
+        "IT Act 2000, Section 66D — Cheating by personation using computer resource",
+        "IPC Section 419 — Punishment for cheating by personation",
+    ],
+    "financial_fraud": [
+        "IT Act 2000, Section 66 — Computer-related offences",
+        "IT Act 2000, Section 66D — Cheating by personation",
+        "IPC Section 420 — Cheating and dishonestly inducing delivery of property",
+    ],
+    "threats_blackmail": [
+        "IPC Section 503 — Criminal intimidation",
+        "IPC Section 506 — Punishment for criminal intimidation",
+        "IPC Section 384 — Punishment for extortion",
+        "IT Act 2000, Section 66E — Violation of privacy",
+    ],
+    "sexual_content": [
+        "POCSO Act 2012 — Protection of Children from Sexual Offences",
+        "IT Act 2000, Section 67B — Child sexually explicit material",
+        "IPC Section 354D — Stalking",
+    ],
+    "general": [
+        "IT Act 2000, Section 66 — Computer-related offences",
+        "Childline 1098 — National child helpline",
+        "Cyber Crime Helpline: 1930",
+        "cybercrime.gov.in — Online complaint portal",
+    ],
+}
+
+
+def _infer_incident_type(summary: str, answers: list[str]) -> str:
+    """Infer the type of incident from the summary and answers for legal references."""
+    combined = (summary + " " + " ".join(answers)).lower()
+    if any(w in combined for w in ("sex", "nude", "naked", "touch", "groom", "sextort")):
+        return "sexual_content"
+    if any(w in combined for w in ("impersonat", "fake account", "pretend", "fake profile")):
+        return "impersonation"
+    if any(w in combined for w in ("money", "fraud", "scam", "payment", "upi", "paytm", "stole")):
+        return "financial_fraud"
+    if any(w in combined for w in ("threat", "blackmail", "extort", "kill", "hurt")):
+        return "threats_blackmail"
+    if any(w in combined for w in ("bully", "harass", "mean", "tease", "mock", "laugh")):
+        return "cyberbullying"
+    return "general"
+
+
+def _build_incident_dossier(case: dict, case_id: str) -> str:
+    """
+    Build a structured, anonymized incident report from a case.
+
+    Returns a markdown-formatted string suitable for export.
+    """
+    severity = case.get("severity", "UNKNOWN")
+    summary = case.get("summary", "No summary available.")
+    created_at = case.get("created_at", "Unknown")
+    status = case.get("status", "unknown")
+    answers = case.get("triage_answers", [])
+
+    # Infer incident type for legal references
+    incident_type = _infer_incident_type(summary, answers)
+    legal_refs = _LEGAL_REFERENCES.get(incident_type, _LEGAL_REFERENCES["general"])
+
+    # Build the dossier
+    dossier_lines = [
+        "# 📋 INCIDENT DOSSIER — Project Albert",
+        "",
+        "**CONFIDENTIAL — For authorized personnel only**",
+        "",
+        "---",
+        "",
+        "## Case Overview",
+        "",
+        f"| Field | Value |",
+        f"|-------|-------|",
+        f"| **Case ID** | `{case_id}` |",
+        f"| **Severity** | {_severity_emoji(severity)} **{severity}** |",
+        f"| **Status** | {status.upper()} |",
+        f"| **Created** | {created_at[:19]} UTC |",
+        f"| **Incident Type** | {incident_type.replace('_', ' ').title()} |",
+        "",
+        "---",
+        "",
+        "## Student's Account (Anonymized)",
+        "",
+    ]
+
+    q_labels = [
+        "What happened",
+        "How they feel",
+        "Known person or stranger",
+    ]
+    for i, label in enumerate(q_labels):
+        answer = answers[i] if i < len(answers) else "[Not provided]"
+        dossier_lines.append(f"**Q{i+1} — {label}:**")
+        dossier_lines.append(f"> {answer}")
+        dossier_lines.append("")
+
+    dossier_lines.extend([
+        "---",
+        "",
+        "## AI Triage Assessment",
+        "",
+        f"**Summary:** {summary}",
+        "",
+        f"**Severity Classification:** {severity}",
+        "",
+    ])
+
+    # Recommended actions based on severity
+    dossier_lines.append("## Recommended Actions")
+    dossier_lines.append("")
+
+    if severity == "HIGH":
+        dossier_lines.extend([
+            "1. **Immediate counselor intervention** — Trained volunteer has been alerted",
+            "2. **Inform school administration** — Principal/vice-principal should be notified",
+            "3. **Contact parents/guardians** — With child's consent if possible",
+            "4. **Preserve evidence** — Screenshots, URLs, timestamps",
+            "5. **Consider filing a formal complaint** — Via cybercrime.gov.in or local police",
+        ])
+    elif severity == "POCSO":
+        dossier_lines.extend([
+            "1. **⚠️ MANDATORY REPORTING** — POCSO Act requires reporting to police within 24 hours",
+            "2. **Contact Childline 1098** — Specialist child protection officers",
+            "3. **Do NOT attempt to handle internally** — This requires statutory intervention",
+            "4. **Preserve all evidence** — Do not delete any messages or media",
+            "5. **Ensure child's immediate safety** — Remove from contact with alleged offender",
+        ])
+    elif severity == "MEDIUM":
+        dossier_lines.extend([
+            "1. **Monitor the situation** — Check in with the student regularly",
+            "2. **Involve school counselor** — Professional guidance recommended",
+            "3. **Help student block and report** — On the relevant platform",
+            "4. **Inform parents/guardians** — With sensitivity and the child's awareness",
+            "5. **Document the incident** — Keep records for potential escalation",
+        ])
+    else:  # LOW
+        dossier_lines.extend([
+            "1. **Self-help resources provided** — Student received coping strategies",
+            "2. **Monitor for escalation** — Single incidents can become patterns",
+            "3. **Encourage open communication** — Student should feel safe reporting again",
+            "4. **Platform reporting** — Help student report on the app/platform",
+        ])
+
+    dossier_lines.extend([
+        "",
+        "---",
+        "",
+        "## Relevant Legal References (India)",
+        "",
+    ])
+    for ref in legal_refs:
+        dossier_lines.append(f"- {ref}")
+
+    dossier_lines.extend([
+        "",
+        "---",
+        "",
+        "## Key Resources",
+        "",
+        "| Resource | Contact |",
+        "|----------|---------|",
+        "| **Childline India** | 1098 (free, 24/7) |",
+        "| **Cyber Crime Helpline** | 1930 |",
+        "| **Cyber Crime Portal** | cybercrime.gov.in |",
+        "| **Police Emergency** | 100 |",
+        "",
+        "---",
+        "",
+        "*Generated by Project Albert — AI-powered child safety triage system*",
+        f"*Report generated: {datetime.now(timezone.utc).isoformat()[:19]} UTC*",
+        "",
+        "**⚠️ Privacy Notice:** This report contains NO personally identifiable information (PII).",
+        "Student identity is protected by design — Albert never collects names, phone numbers, or addresses.",
+    ])
+
+    return "\n".join(dossier_lines)
+
+
+async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /export — Counselor command to generate and download an anonymized incident dossier.
+
+    Only works for counselors who have an active or recently closed case.
+    The dossier is sent as a .md document file for easy sharing with school admin or authorities.
+    """
+    chat_id = update.effective_chat.id
+    _track_msg(chat_id, update.message.message_id)
+
+    # Find the case for this counselor
+    case_id = counselor_to_case.get(chat_id)
+
+    if not case_id or case_id not in cases:
+        # Check if this user has any case at all (as a student)
+        student_case_id = student_to_case.get(chat_id)
+        if student_case_id:
+            await update.message.reply_text(
+                "ℹ️ The */export* command is for counselors only.\n\n"
+                "If you need help, just keep chatting — your counselor is here for you. 💙",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        else:
+            await update.message.reply_text(
+                "ℹ️ No active case found.\n\n"
+                "You can use */export* after claiming a case in the Counselor Group.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        return
+
+    case = cases[case_id]
+
+    # Include triage answers in the case for the dossier
+    student_chat_id = case.get("student_chat_id")
+    if student_chat_id:
+        student_session = sessions.get(student_chat_id, {})
+        case["triage_answers"] = student_session.get("triage_answers", [])
+
+    # Build the dossier
+    dossier_text = _build_incident_dossier(case, case_id)
+
+    # Send as a document
+    safe_case_id = case_id.replace(" ", "_").lower()
+    filename = f"incident_{safe_case_id}.md"
+
+    doc_bytes = dossier_text.encode("utf-8")
+    doc_file = io.BytesIO(doc_bytes)
+    doc_file.name = filename
+
+    try:
+        await context.bot.send_document(
+            chat_id=chat_id,
+            document=doc_file,
+            filename=filename,
+            caption=(
+                f"📋 *Incident Dossier — {case_id}*\n\n"
+                f"Severity: {_severity_emoji(case['severity'])} *{case['severity']}*\n"
+                f"Status: {case['status'].upper()}\n\n"
+                f"This report is anonymized and contains no PII."
+            ),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        logger.info("Incident dossier exported for case_id=%s", case_id)
+    except Exception as e:
+        logger.error("Failed to export dossier for %s: %s", case_id, type(e).__name__)
+        await update.message.reply_text(
+            "⚠️ Could not generate the dossier. Please try again.",
+        )
+
+
+# ==============================================================================
 # SECTION: KEYBOARD BUILDERS
 # ==============================================================================
 # All keyboards are InlineKeyboardMarkup. We NEVER use ReplyKeyboardMarkup.
@@ -1201,7 +1641,10 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "🤖 *Albert — Help*\n\n"
         "• /start — Begin or return to the main menu\n"
         "• /wipe — Emergency panic wipe (deletes all your data instantly)\n"
+        "• /export — _(Counselors only)_ Download an incident dossier\n"
         "• /help — Show this help message\n\n"
+        "🎙️ *Voice Notes:* You can send voice messages at any time — "
+        "Albert will listen and transcribe what you said.\n\n"
         "If you're in a conversation with a counselor, just type your message "
         "and it will be relayed anonymously.\n\n"
         "📞 In an emergency, call *Childline 1098* (free, 24/7, confidential)."
@@ -2182,9 +2625,15 @@ async def run_bot() -> None:
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("wipe", cmd_wipe))
     application.add_handler(CommandHandler("help", cmd_help))
+    application.add_handler(CommandHandler("export", cmd_export))
 
     # Callback query handler (all inline button presses)
     application.add_handler(CallbackQueryHandler(callback_handler))
+
+    # Voice note handler (BEFORE text handler — more specific filter first)
+    application.add_handler(
+        MessageHandler(filters.VOICE, voice_note_handler)
+    )
 
     # Message handler (plain text only, no commands)
     application.add_handler(
