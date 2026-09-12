@@ -1,0 +1,52 @@
+# ============================================
+# Project Albert — .gitignore
+# ============================================
+
+# ---------- Environment / Secrets ----------
+.env
+*.env
+!.env.example
+
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# ---------- Virtual Environments ----------
+venv/
+.venv/
+env/
+ENV/
+
+# ---------- Distribution / Build ----------
+dist/
+build/
+*.egg-info/
+*.egg
+
+# ---------- IDE / Editor ----------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ---------- Linting / Tool Caches ----------
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ---------- OS ----------
+*.log
+*.tmp
+*.bak
+
+# ---------- Misc ----------
+scratch_test.py
+test_fast_path.py
+verify_validation.py
