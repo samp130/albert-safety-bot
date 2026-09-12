@@ -50,3 +50,9 @@ htmlcov/
 scratch_test.py
 test_fast_path.py
 verify_validation.py
+
+# ---------- Local Presentations (Do not push) ----------
+*.pptx
+build_deck.py
+presentation.html
+
